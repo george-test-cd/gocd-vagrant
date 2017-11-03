@@ -1,0 +1,159 @@
+---
+- hosts: go-servers:go-agents
+  become: yes
+  tasks:
+  - name: Add an Apt GoCD signing key
+    apt_key:
+      url: https://download.gocd.org/GOCD-GPG-KEY.asc
+      state: present
+      
+  - name: Add GoCD repository
+    apt_repository:
+      repo: "deb https://download.gocd.org /"
+            
+  - name: Install common packages
+    package:
+      name: "{{ item }}"
+      state: present
+    with_items:
+    - openjdk-8-jdk-headless
+  
+- hosts: go-servers
+  become: yes
+  tasks:
+  - name: install packages
+    package:
+      name: "{{ item }}"
+      state: present
+    with_items:
+    - go-server
+  
+  - name: Enable and start go-server
+    service:
+      name: go-server
+      enabled: yes
+      state: started
+  
+- hosts: go-agents
+  become: yes
+  tasks:
+  - name: Add Ubuntu lxd repository
+    become: yes
+    apt_repository:
+      repo: "ppa:ubuntu-lxc/lxd-stable"
+  
+  - name: Update LXD package
+    become: yes
+    package:
+      name: lxd
+      state: latest
+      
+- hosts: go-agents
+  become: yes
+  tasks:
+        
+  - name: install packages
+    package:
+      name: "{{ item }}"
+      state: present
+    with_items:
+    - go-agent
+    - maven
+    - jq
+  
+  - name: Add user to lxd group 
+    user: 
+      name: go
+      groups: lxd
+      append: yes
+
+  - name: Enable and start go-agent
+    service:
+      name: go-agent
+      enabled: yes
+      state: started
+     
+  - name: Generate custom maven settings file
+    copy:
+      dest: /tmp/workernode-maven-settings.xml
+      content: |
+        <settings xmlns="http://maven.apache.org/SETTINGS/1.0.0"
+          xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+          xsi:schemaLocation="http://maven.apache.org/SETTINGS/1.0.0
+                             http://maven.apache.org/xsd/settings-1.0.0.xsd">
+           
+          <proxies>
+          {% if ansible_env.http_proxy is defined %}
+            <proxy>
+                <id>my-proxy-http</id>
+                <active>true</active>
+                <protocol>http</protocol>
+                <host>{{ ansible_env.http_proxy | urlsplit('hostname') }}</host>
+                <port>{{ ansible_env.http_proxy | urlsplit('port') }}</port>
+             </proxy>
+          {% endif %} 
+          {% if ansible_env.https_proxy is defined %}
+            <proxy>
+                <id>my-proxy-https</id>
+                <active>true</active>
+                <protocol>https</protocol>
+                <host>{{ ansible_env.https_proxy | urlsplit('hostname') }}</host>
+                <port>{{ ansible_env.https_proxy | urlsplit('port') }}</port>
+             </proxy>
+          {% endif %} 
+          </proxies>
+        </settings>
+             
+- hosts: gitlab
+  become: yes
+  vars:
+    gitlab_local_url: "http://localhost/"
+    gitlab_default_user: "root" # don't change
+    gitlab_default_password: "password"
+    gitlab_group: "test"
+  roles:
+  - role: geerlingguy.gitlab
+    environment:
+      GITLAB_ROOT_PASSWORD: "{{ gitlab_default_password }}"
+    gitlab_external_url: "http://192.168.50.2/"
+    gitlab_redirect_http_to_https: "false"
+    
+  post_tasks:
+  - name: Install pip
+    package:
+      name: python-pip
+      state: present
+
+  - name: Install pip packages
+    pip:
+      name: pyapi-gitlab
+    
+  - name: Gitlab proxy configured
+    lineinfile:
+      path: /etc/gitlab/gitlab.rb
+      regexp: "^gitlab_rails['env']"
+      line: "gitlab_rails['env'] = {'http_proxy' => '{{ ansible_env.http_proxy }}', 'https_proxy' => '{{ ansible_env.https_proxy }}'}"
+    when: (ansible_env.http_proxy is defined) or (ansible_env.https_proxy is defined)
+    register: gitlab_proxy_conf
+    
+  - name: Gitlab reloaded
+    command: gitlab-ctl reconfigure
+    when: gitlab_proxy_conf | changed          
+
+  - name: Import gitlab project
+    gitlab_project:
+      server_url: "{{ gitlab_local_url }}"
+      login_user: "{{ gitlab_default_user }}"
+      login_password: "{{ gitlab_default_password }}"
+      import_url: "https://github.com/george-test-cd/{{ item }}"
+      name: "{{ item }}"
+      visibility_level: '20'
+    with_items: #looks like there might be a bug and the order matters
+    - application
+    - ansible-application
+    - ansible-lxd-provisioning
+    - application-integration-tests
+    - environment-prod
+    - environment-qa
+        
+    
